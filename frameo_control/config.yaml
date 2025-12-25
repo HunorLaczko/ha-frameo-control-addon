@@ -1,6 +1,6 @@
 # https://developers.home-assistant.io/docs/add-ons/configuration#add-on-config
 name: "Frameo Control Backend"
-version: "0.1.0"
+version: "0.2.0"
 slug: "frameo_control"
 description: "Backend service to control a Frameo device via ADB over USB or Network."
 url: "https://github.com/HunorLaczko/ha-frameo-control-addon/tree/main/frameo_control"
