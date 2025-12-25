@@ -2,8 +2,8 @@
 ARG BUILD_FROM
 FROM ${BUILD_FROM}
 
-# Install system dependencies including python, pip, build tools, and libusb
-RUN apk add --no-cache python3 py3-pip build-base python3-dev libusb-dev
+# Install system dependencies (libusb for ADB over USB)
+RUN apk add --no-cache libusb-dev build-base
 
 # Copy root filesystem into the container
 COPY rootfs/ /

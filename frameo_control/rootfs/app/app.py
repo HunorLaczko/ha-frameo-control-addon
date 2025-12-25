@@ -1,185 +1,467 @@
-import os
-import asyncio
-import logging
-import re
-from functools import partial
-from quart import Quart, jsonify, request
-import usb1
+"""Frameo ADB Backend Server.
 
+This Quart application serves as a bridge between Home Assistant and Frameo
+devices via ADB (Android Debug Bridge). It maintains persistent connections
+and exposes a REST API for device control.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from dataclasses import dataclass
+from enum import StrEnum
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+import usb1
 from adb_shell.adb_device import AdbDeviceUsb
 from adb_shell.adb_device_async import AdbDeviceTcpAsync
-from adb_shell.transport.usb_transport import UsbTransport
-from adb_shell.exceptions import AdbConnectionError, AdbTimeoutError, UsbDeviceNotFoundError
 from adb_shell.auth.keygen import keygen
 from adb_shell.auth.sign_pythonrsa import PythonRSASigner
+from adb_shell.exceptions import (
+    AdbConnectionError,
+    AdbTimeoutError,
+    UsbDeviceNotFoundError,
+    UsbReadFailedError,
+    UsbWriteFailedError,
+)
+from adb_shell.transport.usb_transport import UsbTransport
+from quart import Quart, jsonify, request
 
-# --- Basic Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Configuration ---
+
+ADB_KEY_PATH = "/data/adbkey"
+ADDON_OPTIONS_PATH = "/data/options.json"
+SERVER_HOST = "0.0.0.0"
+DEFAULT_SERVER_PORT = 5000
+DEFAULT_TRANSPORT_TIMEOUT = 9.0
+USB_AUTH_TIMEOUT = 120.0
+TCP_AUTH_TIMEOUT = 20.0
+DEFAULT_TCP_PORT = 5555
+
+
+def _load_addon_options() -> dict[str, Any]:
+    """Load addon configuration options.
+
+    Returns:
+        Dictionary of addon options.
+
+    """
+    options_path = Path(ADDON_OPTIONS_PATH)
+    if options_path.exists():
+        try:
+            return json.loads(options_path.read_text())
+        except (json.JSONDecodeError, OSError) as err:
+            logging.warning("Failed to load addon options: %s", err)
+    return {}
+
+
+def _get_server_port() -> int:
+    """Get the configured server port.
+
+    Returns:
+        Server port number.
+
+    """
+    # First check environment variable (useful for testing)
+    env_port = os.environ.get("SERVER_PORT")
+    if env_port:
+        try:
+            return int(env_port)
+        except ValueError:
+            pass
+
+    # Then check addon options
+    options = _load_addon_options()
+    return options.get("server_port", DEFAULT_SERVER_PORT)
+
+
+# --- Logging Setup ---
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 _LOGGER = logging.getLogger(__name__)
 
+
+class ConnectionType(StrEnum):
+    """Connection type for ADB devices."""
+
+    USB = "USB"
+    NETWORK = "NETWORK"
+
+
+@dataclass
+class DeviceConnection:
+    """Holds the current device connection state."""
+
+    client: AdbDeviceUsb | AdbDeviceTcpAsync | None = None
+    is_usb: bool = False
+
+    @property
+    def is_connected(self) -> bool:
+        """Check if a device is connected and available."""
+        return self.client is not None and self.client.available
+
+    async def close(self) -> None:
+        """Close the current connection if any."""
+        if self.client is not None:
+            try:
+                if self.is_usb:
+                    await _run_sync(self.client.close)
+                else:
+                    await self.client.close()
+            except Exception as err:
+                _LOGGER.warning("Error closing connection: %s", err)
+            finally:
+                self.client = None
+
+    async def shell(self, command: str) -> str:
+        """Execute a shell command on the connected device.
+
+        Args:
+            command: ADB shell command to execute.
+
+        Returns:
+            Command output.
+
+        Raises:
+            ConnectionError: If no device is connected.
+
+        """
+        if not self.is_connected:
+            raise ConnectionError("Device is not connected or available")
+
+        _LOGGER.info("Executing shell command: '%s'", command)
+
+        if self.is_usb:
+            return await _run_sync(self.client.shell, command)
+        return await self.client.shell(command)
+
+
 # --- Global State ---
-signer = None
-adb_client = None
-is_usb = False
+
+_signer: PythonRSASigner | None = None
+_connection = DeviceConnection()
+
 
 # --- Helper Functions ---
-def _load_or_generate_keys():
-    """Load ADB keys from /data/adbkey, or generate them if they don't exist."""
-    adb_key_path = "/data/adbkey"
-    if not os.path.exists(adb_key_path):
-        _LOGGER.info("No ADB key found, generating a new one at %s", adb_key_path)
-        keygen(adb_key_path)
-    _LOGGER.info("Loading ADB key from %s", adb_key_path)
-    with open(adb_key_path) as f:
-        priv = f.read()
-    with open(adb_key_path + ".pub") as f:
-        pub = f.read()
-    return PythonRSASigner(pub, priv)
 
-async def _run_sync(func, *args, **kwargs):
-    """Run a synchronous (blocking) function in an executor."""
+
+async def _run_sync(func: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous (blocking) function in an executor.
+
+    Args:
+        func: Synchronous function to run.
+        *args: Positional arguments for the function.
+        **kwargs: Keyword arguments for the function.
+
+    Returns:
+        Function result.
+
+    """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
-def _auth_callback_sync(device_client):
-    """Log a message when auth is needed. This is only for sync (USB) connections."""
-    _LOGGER.info("!!!!!! ACTION REQUIRED !!!!!! Please check your device's screen to 'Allow USB Debugging'.")
+
+def _load_or_generate_keys() -> PythonRSASigner:
+    """Load ADB keys from disk, or generate them if they don't exist.
+
+    Returns:
+        RSA signer for ADB authentication.
+
+    """
+    if not os.path.exists(ADB_KEY_PATH):
+        _LOGGER.info("No ADB key found, generating a new one at %s", ADB_KEY_PATH)
+        keygen(ADB_KEY_PATH)
+
+    _LOGGER.info("Loading ADB key from %s", ADB_KEY_PATH)
+
+    with open(ADB_KEY_PATH) as f:
+        private_key = f.read()
+    with open(f"{ADB_KEY_PATH}.pub") as f:
+        public_key = f.read()
+
+    return PythonRSASigner(public_key, private_key)
+
+
+def _usb_auth_callback(device_client: Any) -> None:
+    """Log a message when USB auth is needed.
+
+    Args:
+        device_client: USB device client (unused).
+
+    """
+    _LOGGER.info(
+        "!!! ACTION REQUIRED !!! "
+        "Please check your device's screen to 'Allow USB Debugging'."
+    )
+
+
+def _parse_power_state(dumpsys_output: str) -> dict[str, Any]:
+    """Parse power state from dumpsys output.
+
+    Args:
+        dumpsys_output: Output from 'dumpsys power' command.
+
+    Returns:
+        Dictionary with is_on and brightness values.
+
+    """
+    is_on = "mWakefulness=Awake" in dumpsys_output
+    brightness = 0
+
+    for line in dumpsys_output.splitlines():
+        if "mScreenBrightnessSetting=" in line:
+            try:
+                brightness = int(line.split("=")[1])
+                break
+            except (ValueError, IndexError):
+                pass
+
+    return {"is_on": is_on, "brightness": brightness}
+
 
 # --- Quart Web Application ---
+
 app = Quart(__name__)
 
+
 @app.before_serving
-async def startup():
+async def startup() -> None:
     """Initialize the ADB signer before starting the server."""
-    global signer
-    signer = await _run_sync(_load_or_generate_keys)
-    _LOGGER.info("Frameo ADB Server Initialized and ready for connection requests.")
+    global _signer
+    _signer = await _run_sync(_load_or_generate_keys)
+    _LOGGER.info("Frameo ADB Server initialized and ready for connection requests")
+
 
 # --- API Endpoints ---
+
+
 @app.route("/devices/usb", methods=["GET"])
-async def get_usb_devices():
-    """Scan for and return connected USB ADB devices."""
-    _LOGGER.info("Request received for /devices/usb")
+async def get_usb_devices() -> tuple[Any, int]:
+    """Scan for and return connected USB ADB devices.
+
+    Returns:
+        JSON list of device serial numbers.
+
+    """
+    _LOGGER.info("Request received: GET /devices/usb")
+
     try:
         devices = await _run_sync(UsbTransport.find_all_adb_devices)
         serials = [dev.serial_number for dev in devices]
-        _LOGGER.info(f"Discovered USB devices: {serials}")
-        return jsonify(serials)
+        _LOGGER.info("Discovered USB devices: %s", serials)
+        return jsonify(serials), 200
+
     except UsbDeviceNotFoundError:
-        _LOGGER.warning("No USB devices found during scan.")
-        return jsonify([])
-    except Exception as e:
-        _LOGGER.error(f"Error finding USB devices: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        _LOGGER.warning("No USB devices found during scan")
+        return jsonify([]), 200
+
+    except Exception as err:
+        _LOGGER.exception("Error finding USB devices")
+        return jsonify({"error": str(err)}), 500
+
 
 @app.route("/connect", methods=["POST"])
-async def connect_device():
-    """Establishes and holds a connection to the device."""
-    global adb_client, is_usb
+async def connect_device() -> tuple[Any, int]:
+    """Establish a connection to a Frameo device.
+
+    Expects JSON body with connection details:
+    - connection_type: "USB" or "Network"
+    - serial: Device serial (for USB)
+    - host: Device IP (for Network)
+    - port: Device port (for Network, default 5555)
+
+    Returns:
+        JSON status response.
+
+    """
+    global _connection
+
     conn_details = await request.get_json()
     if not conn_details:
         return jsonify({"error": "Connection details not provided"}), 400
 
     conn_type = conn_details.get("connection_type", "USB").upper()
-    _LOGGER.info(f"Attempting to connect via {conn_type} with details: {conn_details}")
+    _LOGGER.info("Connect request via %s: %s", conn_type, conn_details)
 
     try:
-        if adb_client:
-            await (_run_sync(adb_client.close) if is_usb else adb_client.close())
-            adb_client = None
-            _LOGGER.info("Closed existing connection before reconnecting.")
-        
-        if conn_type == "USB":
-            is_usb = True
+        # Close any existing connection
+        await _connection.close()
+
+        if conn_type == ConnectionType.USB:
             serial = conn_details.get("serial")
             if not serial:
-                return jsonify({"error": "USB connection requires a serial number."}), 400
-            
-            # USB connection is synchronous, so we instantiate the sync class
-            adb_client = AdbDeviceUsb(serial=serial, default_transport_timeout_s=9.0)
-            await _run_sync(adb_client.connect, rsa_keys=[signer], auth_timeout_s=120.0, auth_callback=_auth_callback_sync)
-        
-        else: # NETWORK
-            is_usb = False
-            host = conn_details.get("host")
-            port = int(conn_details.get("port", 5555))
-            if not host:
-                return jsonify({"error": "Network connection requires a host."}), 400
-            
-            # TCP connection is asynchronous, so we can instantiate and use it directly
-            adb_client = AdbDeviceTcpAsync(host=host, port=port, default_transport_timeout_s=9.0)
-            await adb_client.connect(rsa_keys=[signer], auth_timeout_s=20.0)
+                return jsonify({"error": "USB connection requires a serial number"}), 400
 
-        _LOGGER.info(f"Successfully connected to device: {conn_details.get('serial') or conn_details.get('host')}")
+            client = AdbDeviceUsb(
+                serial=serial,
+                default_transport_timeout_s=DEFAULT_TRANSPORT_TIMEOUT,
+            )
+            await _run_sync(
+                client.connect,
+                rsa_keys=[_signer],
+                auth_timeout_s=USB_AUTH_TIMEOUT,
+                auth_callback=_usb_auth_callback,
+            )
+            _connection = DeviceConnection(client=client, is_usb=True)
+
+        else:  # NETWORK
+            host = conn_details.get("host")
+            if not host:
+                return jsonify({"error": "Network connection requires a host"}), 400
+
+            port = int(conn_details.get("port", DEFAULT_TCP_PORT))
+
+            client = AdbDeviceTcpAsync(
+                host=host,
+                port=port,
+                default_transport_timeout_s=DEFAULT_TRANSPORT_TIMEOUT,
+            )
+            await client.connect(rsa_keys=[_signer], auth_timeout_s=TCP_AUTH_TIMEOUT)
+            _connection = DeviceConnection(client=client, is_usb=False)
+
+        identifier = conn_details.get("serial") or conn_details.get("host")
+        _LOGGER.info("Successfully connected to device: %s", identifier)
         return jsonify({"status": "connected"}), 200
 
-    except (AdbConnectionError, AdbTimeoutError, UsbDeviceNotFoundError, usb1.USBError, ConnectionResetError) as e:
-        _LOGGER.error(f"Failed to connect to device: {e}")
-        adb_client = None
-        return jsonify({"error": f"Connection failed: {e}"}), 500
-    except Exception as e:
-        _LOGGER.error(f"An unexpected error occurred during connection: {e}", exc_info=True)
-        adb_client = None
-        return jsonify({"error": f"An unexpected error occurred: {e}"}), 500
+    except (
+        AdbConnectionError,
+        AdbTimeoutError,
+        UsbDeviceNotFoundError,
+        usb1.USBError,
+        ConnectionResetError,
+    ) as err:
+        _LOGGER.error("Failed to connect to device: %s", err)
+        await _connection.close()
+        return jsonify({"error": f"Connection failed: {err}"}), 500
 
-async def _shell_command(command):
-    """Executes a shell command on the existing connection."""
-    global adb_client
+    except Exception as err:
+        _LOGGER.exception("Unexpected error during connection")
+        await _connection.close()
+        return jsonify({"error": f"Unexpected error: {err}"}), 500
 
-    if not adb_client or not adb_client.available:
-        return {"error": "Device is not connected or available."}, 503
-    _LOGGER.info(f"Executing shell command: '{command}'")
-    try:
-        if is_usb:
-            return await _run_sync(adb_client.shell, command), 200
-        return await adb_client.shell(command), 200
-    except (AdbConnectionError, AdbTimeoutError, ConnectionResetError, usb1.USBError) as e:
-        _LOGGER.error(f"Shell command failed: {e}. Connection may be lost.")
-        adb_client = None
-        return {"error": str(e)}, 500
 
 @app.route("/state", methods=["POST"])
-async def get_state():
-    _LOGGER.info("Request received for /state")
-    response, status_code = await _shell_command("dumpsys power")
-    if status_code >= 400: return jsonify(response), status_code
-    
-    is_on = "mWakefulness=Awake" in response
-    brightness = 0
-    for line in response.splitlines():
-        if "mScreenBrightnessSetting=" in line:
-            try: brightness = int(line.split("=")[1]); break
-            except (ValueError, IndexError): pass
-    return jsonify({"is_on": is_on, "brightness": brightness})
+async def get_state() -> tuple[Any, int]:
+    """Get the current device state (screen on/off, brightness).
+
+    Returns:
+        JSON with is_on and brightness values.
+
+    """
+    _LOGGER.info("Request received: POST /state")
+
+    try:
+        output = await _connection.shell("dumpsys power")
+        state = _parse_power_state(output)
+        return jsonify(state), 200
+
+    except ConnectionError as err:
+        return jsonify({"error": str(err)}), 503
+
+    except (
+        AdbConnectionError,
+        AdbTimeoutError,
+        ConnectionResetError,
+        usb1.USBError,
+        UsbReadFailedError,
+        UsbWriteFailedError,
+    ) as err:
+        _LOGGER.error("Device disconnected or connection failed: %s", err)
+        await _connection.close()
+        return jsonify({"error": "Device disconnected", "details": str(err)}), 503
+
 
 @app.route("/shell", methods=["POST"])
-async def run_shell_command():
-    data = await request.get_json(); command = data.get("command")
-    if not command: return jsonify({"error": "Command not provided"}), 400
-    response, status_code = await _shell_command(command)
-    return jsonify({"result": response}), status_code
+async def run_shell_command() -> tuple[Any, int]:
+    """Execute an arbitrary shell command on the device.
+
+    Expects JSON body with:
+    - command: Shell command to execute
+
+    Returns:
+        JSON with command result.
+
+    """
+    data = await request.get_json()
+    command = data.get("command") if data else None
+
+    if not command:
+        return jsonify({"error": "Command not provided"}), 400
+
+    _LOGGER.info("Executing shell command: '%s'", command)
+
+    try:
+        result = await _connection.shell(command)
+        _LOGGER.info("Shell command result: '%s'", result.replace('\n', ' | '))
+        return jsonify({"result": result}), 200
+
+    except ConnectionError as err:
+        return jsonify({"error": str(err)}), 503
+
+    except (
+        AdbConnectionError,
+        AdbTimeoutError,
+        ConnectionResetError,
+        usb1.USBError,
+        UsbReadFailedError,
+        UsbWriteFailedError,
+    ) as err:
+        _LOGGER.error("Device disconnected or command failed: %s", err)
+        await _connection.close()
+        return jsonify({"error": "Device disconnected", "details": str(err)}), 503
+
 
 @app.route("/tcpip", methods=["POST"])
-async def enable_tcpip():
-    """Enables wireless debugging."""
-    if not is_usb or not adb_client or not adb_client.available:
-        return jsonify({"error": "A USB connection is required for this action."}), 400
-    
-    _LOGGER.info("Request received for /tcpip")
+async def enable_tcpip() -> tuple[Any, int]:
+    """Enable wireless ADB debugging on the device.
+
+    Requires an active USB connection.
+
+    Returns:
+        JSON with result.
+
+    """
+    _LOGGER.info("Request received: POST /tcpip")
+
+    if not _connection.is_usb or not _connection.is_connected:
+        return jsonify({"error": "A USB connection is required for this action"}), 400
+
     try:
-        port = 5555
+        port = DEFAULT_TCP_PORT
         await _run_sync(
-            adb_client._open, 
-            destination=f'tcpip:{port}'.encode('utf-8'),
+            _connection.client._open,
+            destination=f"tcpip:{port}".encode("utf-8"),
             transport_timeout_s=None,
             read_timeout_s=10.0,
-            timeout_s=None
+            timeout_s=None,
         )
-        
         return jsonify({"result": f"TCP/IP enabled on port {port}"}), 200
-    except Exception as e:
-        _LOGGER.error(f"ADB Error on tcpip command: {e}")
-        return jsonify({"error": str(e)}), 500
+
+    except (
+        AdbConnectionError,
+        AdbTimeoutError,
+        ConnectionResetError,
+        usb1.USBError,
+        UsbReadFailedError,
+        UsbWriteFailedError,
+    ) as err:
+        _LOGGER.error("Device disconnected during tcpip command: %s", err)
+        await _connection.close()
+        return jsonify({"error": "Device disconnected", "details": str(err)}), 503
+
+    except Exception as err:
+        _LOGGER.exception("ADB error on tcpip command")
+        return jsonify({"error": str(err)}), 500
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    server_port = _get_server_port()
+    _LOGGER.info("Starting Frameo ADB Server on port %d", server_port)
+    app.run(host=SERVER_HOST, port=server_port, debug=False)

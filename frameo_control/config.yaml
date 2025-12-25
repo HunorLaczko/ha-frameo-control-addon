@@ -17,6 +17,10 @@ host_network: true
 # Expose the API port to Home Assistant
 ports:
   "5000/tcp": null
-options: {}
-schema: {}
+ports_description:
+  "5000/tcp": "Frameo Control API server port"
+options:
+  server_port: 5000
+schema:
+  server_port: "port"
 #image: "ghcr.io/hunorlaczko/{arch}-addon-frameo-control"

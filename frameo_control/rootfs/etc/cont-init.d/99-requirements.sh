@@ -1,7 +1,11 @@
-#!/usr/bin/with-contenv bashio
-
+#!/bin/sh
 # Install required Python packages
-if bashio::fs.file_exists "/requirements.txt"; then
-    bashio::log.info "Installing Python packages from /requirements.txt..."
+
+set -e
+
+if [ -f "/requirements.txt" ]; then
+    echo "[INFO] Installing Python packages from /requirements.txt..."
     pip install --no-cache-dir --break-system-packages -r /requirements.txt
 fi
+
+echo "[INFO] Requirements installation complete."

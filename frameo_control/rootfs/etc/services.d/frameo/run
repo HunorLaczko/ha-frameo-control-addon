@@ -1,6 +1,7 @@
-#!/usr/bin/with-contenv bashio
+#!/bin/sh
+# Start the Frameo ADB backend server
 
-bashio::log.info "Starting the generic Frameo Python server..."
+echo "[INFO] Starting the Frameo ADB backend server..."
 
 # Execute the Python server directly
-exec /usr/bin/python3 /app/app.py
+exec python3 /app/app.py
